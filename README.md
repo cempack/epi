@@ -1,8 +1,28 @@
-# epi
+<p align="center">
+  <img src="docs/logo.svg" width="96" alt="">
+</p>
 
-Keeps your Epitech folder organized. It clones new projects from GitHub into the
-right place, with the right name, files their subject PDFs next to them, and
-tells you what needs attention.
+<h1 align="center">epi</h1>
+
+<p align="center">
+  Keeps your Epitech folder organized.
+</p>
+
+<p align="center">
+  <a href="https://github.com/cempack/epi/releases/latest"><img src="https://img.shields.io/github/v/release/cempack/epi?style=flat&color=4cc38a" alt="Latest release"></a>
+  <a href="https://github.com/cempack/epi/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/cempack/epi/ci.yml?style=flat&label=tests" alt="Tests"></a>
+  <img src="https://img.shields.io/badge/Go-00ADD8?style=flat&logo=go&logoColor=white" alt="Go">
+  <img src="https://img.shields.io/badge/Linux-amd64_|_arm64-333?style=flat&logo=linux&logoColor=white" alt="Linux amd64 and arm64">
+  <a href="https://epitech.elliotmoreau.fr"><img src="https://img.shields.io/badge/part_of-epitech--toolkit-4cc38a?style=flat" alt="Part of epitech-toolkit"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/cempack/epi?style=flat" alt="MIT license"></a>
+</p>
+
+<p align="center">
+  <img src="docs/epi.png" width="760" alt="The epi dashboard: projects grouped by module, my_ls selected with its git status and subjects">
+</p>
+
+epi clones new projects from GitHub into the right place, with the right name,
+files their subject PDFs next to them, and tells you what needs attention.
 
 ```
 ~/Epitech/
