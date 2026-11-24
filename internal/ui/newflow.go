@@ -236,6 +236,7 @@ func RunNew(root, arg string) error {
 	// Execute.
 	var cloneErr error
 	var cloneOut []byte
+	newModule := !workspace.Exists(modPath)
 	spin("Cloning "+repo.Name, func() {
 		_ = os.MkdirAll(modPath, 0o755)
 		cmd := exec.Command("git", "clone", "--quiet", cloneURL, dest)
@@ -243,6 +244,9 @@ func RunNew(root, arg string) error {
 		cloneOut, cloneErr = cmd.CombinedOutput()
 	})
 	if cloneErr != nil {
+		if newModule {
+			_ = os.Remove(modPath) // only removes it if it's still empty
+		}
 		say(sRed.Render("  ✗ clone failed") + "\n" + sMuted.Render(indent(strings.TrimSpace(string(cloneOut)))))
 		if strings.Contains(string(cloneOut), "Permission denied") || strings.Contains(string(cloneOut), "passphrase") {
 			say(sMuted.Render("  hint: unlock your SSH key with ") + sText.Render("ssh-add") + sMuted.Render(" and retry"))
