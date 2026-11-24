@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +15,12 @@ import (
 //
 // Rule: color carries meaning. Plain text is the default; one accent marks
 // focus; green/yellow/red only appear for status.
+// re draws on stderr, where the UI goes. Styles must be built from it: a
+// style keeps the renderer it was made with, and package-level styles are
+// made before main runs, when the default renderer still watches stdout.
+// With stdout captured (`cd "$(epi)"`) they'd lose their colors.
+var re = lipgloss.NewRenderer(os.Stderr)
+
 var (
 	cText   = lipgloss.NoColor{}
 	cMuted  = lipgloss.Color("8")
@@ -24,16 +31,16 @@ var (
 )
 
 var (
-	sText   = lipgloss.NewStyle()
-	sBold   = lipgloss.NewStyle().Bold(true)
-	sMuted  = lipgloss.NewStyle().Foreground(cMuted)
-	sFaint  = lipgloss.NewStyle().Foreground(cMuted).Faint(true)
-	sAccent = lipgloss.NewStyle().Foreground(cAccent)
-	sGreen  = lipgloss.NewStyle().Foreground(cGreen)
-	sYellow = lipgloss.NewStyle().Foreground(cYellow)
-	sRed    = lipgloss.NewStyle().Foreground(cRed)
+	sText   = re.NewStyle()
+	sBold   = re.NewStyle().Bold(true)
+	sMuted  = re.NewStyle().Foreground(cMuted)
+	sFaint  = re.NewStyle().Foreground(cMuted).Faint(true)
+	sAccent = re.NewStyle().Foreground(cAccent)
+	sGreen  = re.NewStyle().Foreground(cGreen)
+	sYellow = re.NewStyle().Foreground(cYellow)
+	sRed    = re.NewStyle().Foreground(cRed)
 
-	sCard = lipgloss.NewStyle().
+	sCard = re.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(cMuted).
 		Padding(0, 2)
