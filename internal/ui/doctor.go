@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -29,25 +30,43 @@ var moduleDirRe = regexp.MustCompile(`^(pool|workshops|[a-z]{3}\d{3}(_[a-z0-9]+)
 
 const bigFile = 20 << 20 // 20 MB
 
+type strayKind int
+
+const (
+	strayNew       strayKind = iota // target doesn't exist yet -> move
+	strayDuplicate                  // target exists and SHA256 matches -> delete download copy
+	strayUpdated                    // target exists and content differs -> replace or save as -2
+)
+
 type stray struct {
 	src, dst string
 	project  string
+	kind     strayKind
 }
 
-// RunDoctor checks the tree and offers to file stray subject PDFs.
+type cleanableFile struct {
+	path   string
+	reason string
+}
+
+// RunDoctor checks the tree and offers safe interactive fixes (filing stray
+// subjects, cleaning duplicate downloads, and removing junk/bootstrap binaries).
 func RunDoctor(root string) error {
 	var (
-		mods   []*workspace.Module
-		strays []stray
-		uncl   []remote.Repo
-		junk   = map[*workspace.Project][]string{}
-		netErr error
+		mods      []*workspace.Module
+		strays    []stray
+		uncl      []remote.Repo
+		junk      = map[*workspace.Project][]string{}
+		cleanable []cleanableFile
+		netErr    error
 	)
 	spin("Examining "+tilde(root), func() {
 		mods, _ = workspace.Scan(root)
 		for _, m := range mods {
 			for _, p := range m.Projects {
-				junk[p] = scanJunk(p.Path)
+				items, rm := scanJunk(p)
+				junk[p] = items
+				cleanable = append(cleanable, rm...)
 			}
 		}
 		strays = findStrays(mods)
@@ -68,7 +87,9 @@ func RunDoctor(root string) error {
 	naming := section{title: "Naming"}
 	placement := section{title: "Placement"}
 	work := section{title: "Unsaved work"}
+	bootSec := section{title: "Bootstrap hygiene"}
 	clutter := section{title: "Clutter"}
+	bootOnly := section{title: "Bootstrap only (missing main subject)"}
 	missing := section{title: "Missing subjects"}
 	github := section{title: "On GitHub, not cloned"}
 
@@ -97,6 +118,10 @@ func RunDoctor(root string) error {
 				work.items = append(work.items, finding{sAccent.Render("↑"), rel(root, p.Path) + sMuted.Render(fmt.Sprintf("  %d commit(s) not pushed", g.Ahead))})
 				ok = false
 			}
+			if g.Behind > 0 {
+				work.items = append(work.items, finding{sAccent.Render("↓"), rel(root, p.Path) + sMuted.Render(fmt.Sprintf("  %d commit(s) behind origin", g.Behind))})
+				ok = false
+			}
 			if g.Dirty > 0 || g.Untracked > 0 {
 				var parts []string
 				if g.Dirty > 0 {
@@ -108,11 +133,24 @@ func RunDoctor(root string) error {
 				work.items = append(work.items, finding{sYellow.Render("●"), rel(root, p.Path) + sMuted.Render("  "+strings.Join(parts, ", "))})
 				ok = false
 			}
+			if p.Bootstrap.HasDir {
+				for _, bin := range p.Bootstrap.Binaries {
+					bootSec.items = append(bootSec.items, finding{sYellow.Render("⚙"), rel(root, bin) + sFaint.Render("  compiled binary in bootstrap/")})
+					ok = false
+				}
+				if p.Bootstrap.Tracked && p.HasMain {
+					bootSec.items = append(bootSec.items, finding{sYellow.Render("⚙"), rel(root, p.Bootstrap.Dir) + sFaint.Render("  tracked in a repo with a Makefile (Banana/C-O1 risk)")})
+				}
+			}
 			for _, j := range junk[p] {
 				clutter.items = append(clutter.items, finding{"⌫", rel(root, j)})
 			}
-			if len(p.Subjects) == 0 && m.Dir != "workshops" {
-				missing.items = append(missing.items, finding{"▤", rel(root, p.Path)})
+			if m.Dir != "workshops" {
+				if len(p.Subjects) == 0 {
+					missing.items = append(missing.items, finding{"▤", rel(root, p.Path)})
+				} else if p.MainSubject() == nil && p.BootstrapSubject() != nil {
+					bootOnly.items = append(bootOnly.items, finding{"▤", rel(root, p.Path) + sFaint.Render("  has bootstrap only")})
+				}
 			}
 			if ok {
 				healthy++
@@ -130,14 +168,35 @@ func RunDoctor(root string) error {
 	// Report.
 	say("")
 	say(" " + Header("doctor"))
-	say(" " + Rule(56))
-	say(" " + healthBar(healthy, total, 40) + "  " + sBold.Render(fmt.Sprintf("%d/%d", healthy, total)) + sMuted.Render(" projects spotless"))
+	summaryW := min(max(TermWidth()-4, 48), 72)
+	barW := min(max(summaryW-28, 18), 36)
+	var sumB strings.Builder
+	sumB.WriteString(healthBar(healthy, total, barW) + "  " + sBold.Render(fmt.Sprintf("%d/%d", healthy, total)) + sMuted.Render(" spotless"))
+	var pills []string
+	if len(work.items) > 0 {
+		pills = append(pills, Pill(fmt.Sprintf("%d unsaved", len(work.items)), cYellow))
+	}
+	if len(bootSec.items) > 0 {
+		pills = append(pills, Pill(fmt.Sprintf("%d bootstrap", len(bootSec.items)), cYellow))
+	}
+	if len(clutter.items) > 0 {
+		pills = append(pills, Pill(fmt.Sprintf("%d clutter", len(clutter.items)), cYellow))
+	}
+	if len(uncl) > 0 {
+		pills = append(pills, Pill(fmt.Sprintf("%d uncloned", len(uncl)), cAccent))
+	}
+	if len(pills) > 0 {
+		sumB.WriteString("\n" + strings.Join(pills, " "))
+	} else {
+		sumB.WriteString("\n" + sGreen.Render("✓ everything looks spotless"))
+	}
+	say(IndentBox("Workspace Health", sumB.String(), summaryW, false))
 	say("")
-	for _, s := range []section{naming, placement, work, clutter, github, missing} {
+	for _, s := range []section{naming, placement, work, bootSec, clutter, github, bootOnly, missing} {
 		if len(s.items) == 0 {
 			continue
 		}
-		say(" " + sBold.Render(s.title) + sFaint.Render(fmt.Sprintf(" %d", len(s.items))))
+		say(SectionHeading(s.title, len(s.items)))
 		for i, f := range s.items {
 			if i == 12 {
 				say(sFaint.Render(fmt.Sprintf("   … and %d more", len(s.items)-12)))
@@ -148,35 +207,143 @@ func RunDoctor(root string) error {
 		say("")
 	}
 	if len(uncl) > 0 {
-		say(sMuted.Render(" clone one with ") + sText.Render("epi new") + "\n")
+		say(" " + sMuted.Render("clone one with ") + sKey.Render("epi new") + "\n")
 	}
 
-	// The one fixer: file stray subject PDFs.
-	if len(strays) == 0 {
-		return nil
-	}
-	say(" " + sBold.Render("Stray subjects in ~/Downloads") + sFaint.Render(fmt.Sprintf(" %d", len(strays))))
-	var opts []huh.Option[int]
-	var picked []int
-	for i, s := range strays {
-		label := sText.Render(filepath.Base(s.src)) + sMuted.Render("  →  "+rel(root, s.dst))
-		opts = append(opts, huh.NewOption(label, i).Selected(true))
-		picked = append(picked, i)
-	}
-	if err := form(huh.NewGroup(
-		huh.NewMultiSelect[int]().Title("File these?").Description("They'll be moved out of ~/Downloads.").Options(opts...).Value(&picked),
-	)).Run(); err != nil {
-		return quiet(err)
-	}
-	for _, i := range picked {
-		s := strays[i]
-		if err := subjects.Move(s.src, s.dst); err != nil {
-			say(sYellow.Render("   ● ") + sMuted.Render(filepath.Base(s.src)+": "+err.Error()))
-			continue
+	// Fixer 1: file stray / updated / duplicate subjects in ~/Downloads.
+	var newStrays, dupStrays, updStrays []stray
+	for _, s := range strays {
+		switch s.kind {
+		case strayNew:
+			newStrays = append(newStrays, s)
+		case strayDuplicate:
+			dupStrays = append(dupStrays, s)
+		case strayUpdated:
+			updStrays = append(updStrays, s)
 		}
-		say(sGreen.Render("   ✓ ") + sText.Render(rel(root, s.dst)))
 	}
-	say("")
+
+	if len(newStrays) > 0 {
+		say(" " + sBold.Render("Stray subjects in ~/Downloads") + sFaint.Render(fmt.Sprintf(" %d", len(newStrays))))
+		var opts []huh.Option[int]
+		var picked []int
+		for i, s := range newStrays {
+			label := sText.Render(filepath.Base(s.src)) + sMuted.Render("  →  "+rel(root, s.dst))
+			opts = append(opts, huh.NewOption(label, i).Selected(true))
+			picked = append(picked, i)
+		}
+		if err := form(huh.NewGroup(
+			huh.NewMultiSelect[int]().Title("File these?").Description("They'll be moved out of ~/Downloads.").Options(opts...).Value(&picked),
+		)).Run(); err != nil {
+			return quiet(err)
+		}
+		for _, i := range picked {
+			s := newStrays[i]
+			if err := subjects.Move(s.src, s.dst); err != nil {
+				say(sYellow.Render("   ● ") + sMuted.Render(filepath.Base(s.src)+": "+err.Error()))
+				continue
+			}
+			say(sGreen.Render("   ✓ ") + sText.Render(rel(root, s.dst)))
+		}
+		say("")
+	}
+
+	if len(updStrays) > 0 {
+		say(" " + sBold.Render("Updated or extra subjects in ~/Downloads") + sFaint.Render(fmt.Sprintf(" %d", len(updStrays))))
+		for _, s := range updStrays {
+			var action string
+			err := form(huh.NewGroup(
+				huh.NewSelect[string]().
+					Title(filepath.Base(s.src) + " differs from " + filepath.Base(s.dst)).
+					Description("Same project and kind, different file contents.").
+					Options(
+						huh.NewOption("Replace "+rel(root, s.dst), "replace"),
+						huh.NewOption("Keep both (save with -2 suffix)", "keep"),
+						huh.NewOption("Skip", "skip"),
+					).
+					Value(&action),
+			)).Run()
+			if err != nil {
+				return quiet(err)
+			}
+			switch action {
+			case "replace":
+				if err := subjects.Replace(s.src, s.dst); err != nil {
+					say(sYellow.Render("   ● ") + sMuted.Render(err.Error()))
+				} else {
+					say(sGreen.Render("   ✓ replaced ") + sText.Render(rel(root, s.dst)))
+				}
+			case "keep":
+				alt := nextAvailablePath(s.dst)
+				if err := subjects.Move(s.src, alt); err != nil {
+					say(sYellow.Render("   ● ") + sMuted.Render(err.Error()))
+				} else {
+					say(sGreen.Render("   ✓ ") + sText.Render(rel(root, alt)))
+				}
+			}
+		}
+		say("")
+	}
+
+	if len(dupStrays) > 0 {
+		say(" " + sBold.Render("Already-filed duplicates in ~/Downloads") + sFaint.Render(fmt.Sprintf(" %d", len(dupStrays))))
+		var opts []huh.Option[int]
+		var picked []int
+		for i, s := range dupStrays {
+			label := sText.Render(filepath.Base(s.src)) + sFaint.Render("  (identical to "+rel(root, s.dst)+")")
+			opts = append(opts, huh.NewOption(label, i))
+		}
+		if err := form(huh.NewGroup(
+			huh.NewMultiSelect[int]().
+				Title("Delete duplicate downloads?").
+				Description("Exact SHA256 match with files already inside ~/Epitech.").
+				Options(opts...).
+				Value(&picked),
+		)).Run(); err != nil {
+			return quiet(err)
+		}
+		for _, i := range picked {
+			s := dupStrays[i]
+			if err := os.Remove(s.src); err != nil {
+				say(sYellow.Render("   ● ") + sMuted.Render(err.Error()))
+			} else {
+				say(sGreen.Render("   ✓ removed ") + sText.Render(filepath.Base(s.src)))
+			}
+		}
+		say("")
+	}
+
+	// Fixer 2: remove editor leftovers and compiled binaries in bootstrap/.
+	if len(cleanable) > 0 {
+		var opts []huh.Option[int]
+		var picked []int
+		for i, c := range cleanable {
+			label := sText.Render(rel(root, c.path)) + sFaint.Render("  "+c.reason)
+			opts = append(opts, huh.NewOption(label, i))
+		}
+		if err := form(huh.NewGroup(
+			huh.NewMultiSelect[int]().
+				Title("Clean leftover junk / bootstrap binaries?").
+				Description("Select files to delete, or leave empty to keep everything.").
+				Options(opts...).
+				Value(&picked).
+				Height(min(len(opts)+2, 12)),
+		)).Run(); err != nil {
+			return quiet(err)
+		}
+		for _, i := range picked {
+			c := cleanable[i]
+			if err := os.Remove(c.path); err != nil {
+				say(sYellow.Render("   ● ") + sMuted.Render(err.Error()))
+			} else {
+				say(sGreen.Render("   ✓ removed ") + sText.Render(rel(root, c.path)))
+			}
+		}
+		if len(picked) > 0 {
+			say("")
+		}
+	}
+
 	return nil
 }
 
@@ -189,10 +356,16 @@ func healthBar(n, total, width int) string {
 	return sAccent.Render(strings.Repeat("━", filled)) + sFaint.Render(strings.Repeat("━", width-filled))
 }
 
-// scanJunk finds editor leftovers and huge files, skipping .git.
-func scanJunk(dir string) []string {
+// scanJunk finds editor leftovers, huge files, and compiled bootstrap binaries.
+func scanJunk(p *workspace.Project) ([]string, []cleanableFile) {
 	var out []string
-	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+	var clean []cleanableFile
+	seen := map[string]bool{}
+	for _, bin := range p.Bootstrap.Binaries {
+		seen[bin] = true
+		clean = append(clean, cleanableFile{path: bin, reason: "bootstrap binary"})
+	}
+	_ = filepath.WalkDir(p.Path, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -205,6 +378,10 @@ func scanJunk(dir string) []string {
 		n := d.Name()
 		if (strings.HasPrefix(n, "#") && strings.HasSuffix(n, "#")) || strings.HasSuffix(n, "~") || n == "vgcore" || strings.HasPrefix(n, "vgcore.") {
 			out = append(out, path)
+			if !seen[path] {
+				seen[path] = true
+				clean = append(clean, cleanableFile{path: path, reason: "editor/valgrind leftover"})
+			}
 			return nil
 		}
 		if info, err := d.Info(); err == nil && info.Size() > bigFile {
@@ -212,12 +389,11 @@ func scanJunk(dir string) []string {
 		}
 		return nil
 	})
-	return out
+	return out, clean
 }
 
-// findStrays matches recent PDFs in ~/Downloads to projects that don't have
-// that subject filed yet. The longest matching project name wins, so
-// "my_printf_roadmap.pdf" goes to my_printf, not to a hypothetical "printf".
+// findStrays matches recent PDFs in ~/Downloads to projects and classifies each
+// as new, identical duplicate, or updated version.
 func findStrays(mods []*workspace.Module) []stray {
 	type key struct{ name, slug string }
 	projects := map[key]*workspace.Project{}
@@ -246,14 +422,47 @@ func findStrays(mods []*workspace.Module) []stray {
 		if best == nil {
 			continue
 		}
-		dst := filepath.Join(best.Module.Path, "subjects", epitech.SubjectFile(best.Name, c.Kind, ".pdf"))
-		if workspace.Exists(dst) {
-			continue // already filed (or a same-kind subject exists)
+		ext := strings.ToLower(filepath.Ext(c.Path))
+		if ext == "" {
+			ext = ".pdf"
 		}
-		out = append(out, stray{src: c.Path, dst: dst, project: best.Name})
+		dst := filepath.Join(best.Module.Path, "subjects", epitech.SubjectFile(best.Name, c.Kind, ext))
+		kind := strayNew
+		if workspace.Exists(dst) {
+			if subjects.SameFile(c.Path, dst) {
+				kind = strayDuplicate
+			} else {
+				// Also check whether it's an exact match of another already-filed subject of this project.
+				dup := false
+				for _, s := range best.Subjects {
+					if subjects.SameFile(c.Path, s.Path) {
+						dst = s.Path
+						dup = true
+						break
+					}
+				}
+				if dup {
+					kind = strayDuplicate
+				} else {
+					kind = strayUpdated
+				}
+			}
+		}
+		out = append(out, stray{src: c.Path, dst: dst, project: best.Name, kind: kind})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].dst < out[j].dst })
 	return out
+}
+
+func nextAvailablePath(dst string) string {
+	ext := filepath.Ext(dst)
+	stem := strings.TrimSuffix(dst, ext)
+	for n := 2; ; n++ {
+		cand := fmt.Sprintf("%s-%d%s", stem, n, ext)
+		if !workspace.Exists(cand) {
+			return cand
+		}
+	}
 }
 
 func rel(root, p string) string {

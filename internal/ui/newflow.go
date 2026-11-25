@@ -153,14 +153,16 @@ func RunNew(root, arg string) error {
 
 	// Subject PDFs to file.
 	plan := map[string]string{} // src -> dst
+	pickedBootstrap := false
 	if len(cands) > 0 {
 		var picked []string
 		var opts []huh.Option[string]
 		for _, c := range cands {
 			base := filepath.Base(c.Path)
+			ext := strings.ToLower(filepath.Ext(base))
 			label := sText.Render(base)
 			if c.Match {
-				label += sMuted.Render("  →  " + epitech.SubjectFile(name, c.Kind, ".pdf"))
+				label += sMuted.Render("  →  " + epitech.SubjectFile(name, c.Kind, ext))
 			} else if len(c.Title) > 0 {
 				label += sFaint.Render("  " + truncate(c.Title[0], 30))
 			}
@@ -201,12 +203,35 @@ func RunNew(root, arg string) error {
 					c = x
 				}
 			}
-			dst := epitech.SubjectFile(name, c.Kind, ".pdf")
+			if c.Kind == "bootstrap" {
+				pickedBootstrap = true
+			}
+			ext := strings.ToLower(filepath.Ext(src))
+			if ext == "" {
+				ext = ".pdf"
+			}
+			dst := epitech.SubjectFile(name, c.Kind, ext)
 			for n := 2; used[dst]; n++ { // two "bootstrap"s? -> my_x-bootstrap-2.pdf
-				dst = epitech.SubjectFile(name, strings.TrimPrefix(c.Kind+fmt.Sprintf("-%d", n), "-"), ".pdf")
+				dst = epitech.SubjectFile(name, strings.TrimPrefix(c.Kind+fmt.Sprintf("-%d", n), "-"), ext)
 			}
 			used[dst] = true
 			plan[src] = filepath.Join(modPath, "subjects", dst)
+		}
+	}
+
+	// Offer to scaffold bootstrap/ when a bootstrap subject is being filed.
+	initBootstrap := false
+	if pickedBootstrap {
+		initBootstrap = true
+		if err := form(huh.NewGroup(
+			huh.NewConfirm().
+				Title("Create bootstrap/ directory inside the repo?").
+				Description("Adds bootstrap/ and ignores compiled bootstrap binaries in .gitignore.").
+				Affirmative("Yes").
+				Negative("No").
+				Value(&initBootstrap),
+		)).Run(); err != nil {
+			return quiet(err)
 		}
 	}
 
@@ -214,17 +239,20 @@ func RunNew(root, arg string) error {
 	dest := filepath.Join(modPath, name)
 	cloneURL := repo.CloneURL(idx.preferSSH)
 	var b strings.Builder
-	row := func(icon, k, v string) { b.WriteString(icon + " " + sFaint.Render(fmt.Sprintf("%-8s", k)) + v + "\n") }
+	row := func(icon, k, v string) { b.WriteString(icon + " " + sFaint.Render(fmt.Sprintf("%-9s", k)) + v + "\n") }
 	row(sMuted.Render("⎇"), "clone", sText.Render(repo.Owner+"/"+repo.Name))
 	row(sMuted.Render("→"), "into", sText.Render(tilde(dest)))
 	if !workspace.Exists(modPath) {
 		row(sMuted.Render("✦"), "module", sMuted.Render("new folder ")+sText.Render(modDir))
 	}
+	if initBootstrap {
+		row(sMuted.Render("⚙"), "bootstrap", sText.Render("bootstrap/ + .gitignore rules"))
+	}
 	for src, dst := range plan {
 		row(sMuted.Render("▤"), "subject", sText.Render(filepath.Base(src))+sMuted.Render(" → ")+sText.Render(filepath.Base(dst)))
 	}
 	if len(plan) == 0 {
-		row(sFaint.Render("▤"), "subject", sFaint.Render("none — run epi doctor later to file it"))
+		row(sFaint.Render("▤"), "subject", sFaint.Render("none — run epi subject later to file it"))
 	}
 	say(card(sCard, strings.TrimRight(b.String(), "\n")))
 
@@ -252,6 +280,10 @@ func RunNew(root, arg string) error {
 			say(sMuted.Render("  hint: unlock your SSH key with ") + sText.Render("ssh-add") + sMuted.Render(" and retry"))
 		}
 		return errCancelled
+	}
+	if initBootstrap {
+		_ = os.MkdirAll(filepath.Join(dest, "bootstrap"), 0o755)
+		_, _ = ensureGitignoreLines(dest, []string{"/bootstrap/bootstrap", "/bootstrap/*.o", "/bootstrap/a.out"})
 	}
 	var filed []string
 	for src, dst := range plan {

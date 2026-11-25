@@ -1,8 +1,10 @@
 // Package subjects finds subject PDFs (usually in ~/Downloads), reads their
-// title, and files them under <module>/subjects with canonical names.
+// title, searches across filed subjects, and moves them under <module>/subjects
+// with canonical names.
 package subjects
 
 import (
+	"crypto/sha256"
 	"io"
 	"os"
 	"os/exec"
@@ -20,7 +22,7 @@ type Candidate struct {
 	Path    string
 	ModTime time.Time
 	Title   []string // first non-empty lines of page 1
-	Kind    string   // "", bootstrap, kickoff, roadmap
+	Kind    string   // "", bootstrap, kickoff, roadmap, annex, bonus, slides, examples
 	Match   bool     // looks like it belongs to the project
 	Subject bool     // looks like an Epitech subject at all
 }
@@ -51,6 +53,9 @@ func Downloads() string {
 // Title extracts the first few lines of page 1. Missing pdftotext is not fatal:
 // we just fall back to filename matching.
 func Title(path string) []string {
+	if !strings.EqualFold(filepath.Ext(path), ".pdf") {
+		return nil
+	}
 	out, err := exec.Command("pdftotext", "-l", "1", path, "-").Output()
 	if err != nil {
 		return nil
@@ -67,13 +72,39 @@ func Title(path string) []string {
 	return lines
 }
 
-// Find scans dir for PDFs modified in the last maxAge, reads their titles in
-// parallel and marks those whose filename or title contains the slug.
+// FullText returns the complete extracted text of a PDF (via pdftotext) or
+// plain-text file.
+func FullText(path string) (string, error) {
+	if strings.EqualFold(filepath.Ext(path), ".pdf") {
+		out, err := exec.Command("pdftotext", path, "-").Output()
+		if err != nil {
+			return "", err
+		}
+		return string(out), nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// Find scans dir for recent subject PDFs (and companion .txt/.md files that
+// explicitly match slug), reads their titles in parallel, and marks matches.
 func Find(dir, slug string, maxAge time.Duration, limit int) []Candidate {
 	entries, _ := os.ReadDir(dir)
 	var cands []Candidate
 	for _, e := range entries {
-		if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".pdf") {
+		if e.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		if ext != ".pdf" && ext != ".txt" && ext != ".md" {
+			continue
+		}
+		// Non-PDF files are only candidates when we have a specific slug and
+		// the filename mentions it (avoids showing random .txt files).
+		if ext != ".pdf" && !Matches(slug, e.Name(), nil) {
 			continue
 		}
 		info, err := e.Info()
@@ -122,34 +153,164 @@ func Matches(slug, filename string, title []string) bool {
 		strings.Contains(epitech.Squash(strings.Join(title, " ")), want)
 }
 
+// SameFile reports whether two files have identical size and SHA256 digest.
+func SameFile(a, b string) bool {
+	ia, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	ib, err := os.Stat(b)
+	if err != nil || ia.Size() != ib.Size() {
+		return false
+	}
+	ha, err := sha256File(a)
+	if err != nil {
+		return false
+	}
+	hb, err := sha256File(b)
+	return err == nil && ha == hb
+}
+
+func sha256File(p string) ([32]byte, error) {
+	var zero [32]byte
+	f, err := os.Open(p)
+	if err != nil {
+		return zero, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return zero, err
+	}
+	var sum [32]byte
+	copy(sum[:], h.Sum(nil))
+	return sum, nil
+}
+
 // Move renames src to dst, falling back to copy+delete across filesystems.
 // It never overwrites: an existing dst is returned as os.ErrExist.
 func Move(src, dst string) error {
 	if _, err := os.Stat(dst); err == nil {
 		return os.ErrExist
 	}
+	return moveFile(src, dst, false)
+}
+
+// Replace moves src onto dst, overwriting an existing dst only after the copy
+// succeeds.
+func Replace(src, dst string) error {
+	return moveFile(src, dst, true)
+}
+
+func moveFile(src, dst string, overwrite bool) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	if err := os.Rename(src, dst); err == nil {
-		return nil
+	if overwrite {
+		if err := os.Rename(src, dst); err == nil {
+			return nil
+		}
+	} else {
+		if err := os.Rename(src, dst); err == nil {
+			return nil
+		}
 	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	tmp := dst
+	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	if overwrite {
+		tmp = dst + ".epi-tmp"
+		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	}
+	out, err := os.OpenFile(tmp, flags, 0o644)
 	if err != nil {
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()
-		os.Remove(dst)
+		os.Remove(tmp)
 		return err
 	}
 	if err := out.Close(); err != nil {
+		os.Remove(tmp)
 		return err
 	}
+	if overwrite {
+		if err := os.Rename(tmp, dst); err != nil {
+			os.Remove(tmp)
+			return err
+		}
+	}
 	return os.Remove(src)
+}
+
+// SearchTarget identifies a filed document to search.
+type SearchTarget struct {
+	Owner string // e.g. "psu100_unix/my_sudo" or "docs"
+	Label string // e.g. "my_sudo.pdf"
+	Path  string
+}
+
+// SearchHit is one document that matched a query, with up to 3 snippet lines.
+type SearchHit struct {
+	Target   SearchTarget
+	Snippets []string
+	Count    int
+}
+
+// Search scans all targets concurrently for case-insensitive occurrences of query.
+func Search(targets []SearchTarget, query string) []SearchHit {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return nil
+	}
+	var (
+		mu   sync.Mutex
+		wg   sync.WaitGroup
+		sem  = make(chan struct{}, 8)
+		hits []SearchHit
+	)
+	for _, t := range targets {
+		wg.Add(1)
+		go func(t SearchTarget) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			text, err := FullText(t.Path)
+			if err != nil {
+				return
+			}
+			var snippets []string
+			count := 0
+			for _, line := range strings.Split(text, "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				if strings.Contains(strings.ToLower(line), q) {
+					count++
+					if len(snippets) < 3 {
+						snippets = append(snippets, line)
+					}
+				}
+			}
+			if count > 0 {
+				mu.Lock()
+				hits = append(hits, SearchHit{Target: t, Snippets: snippets, Count: count})
+				mu.Unlock()
+			}
+		}(t)
+	}
+	wg.Wait()
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].Count != hits[j].Count {
+			return hits[i].Count > hits[j].Count
+		}
+		return hits[i].Target.Path < hits[j].Target.Path
+	})
+	return hits
 }

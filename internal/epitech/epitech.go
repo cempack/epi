@@ -137,8 +137,59 @@ func SubjectKind(filename, text string) string {
 		return "kickoff"
 	case strings.Contains(s, "roadmap") || strings.Contains(s, "feuille de route") || strings.Contains(s, "feuille_de_route"):
 		return "roadmap"
+	case strings.Contains(s, "annexe") || strings.Contains(s, "annex") || strings.Contains(s, "appendix"):
+		return "annex"
+	case strings.Contains(s, "bonus"):
+		return "bonus"
+	case strings.Contains(s, "slides") || strings.Contains(s, "presentation") || strings.Contains(s, "présentation"):
+		return "slides"
+	case strings.Contains(s, "example") || strings.Contains(s, "exemple"):
+		return "examples"
 	}
 	return ""
+}
+
+// KnownKinds lists the standard subject suffixes in display order.
+var KnownKinds = []string{"", "bootstrap", "kickoff", "roadmap", "annex", "bonus", "slides", "examples"}
+
+var trailingNumRe = regexp.MustCompile(`-(?:v?\d+)$`)
+
+// SubjectKindFromFile infers the kind of an already-filed subject given its
+// project name and base filename ("my_sudo-bootstrap.pdf" -> "bootstrap",
+// "my_sudo.pdf" -> "", "my_ls-bootstrap-2.pdf" -> "bootstrap").
+func SubjectKindFromFile(project, filename string) string {
+	base := filename
+	if i := strings.LastIndex(base, "."); i > 0 {
+		base = base[:i]
+	}
+	if base == project {
+		return ""
+	}
+	if strings.HasPrefix(base, project+"-") {
+		suf := strings.TrimPrefix(base, project+"-")
+		suf = trailingNumRe.ReplaceAllString(suf, "")
+		return suf
+	}
+	return SubjectKind(filename, "")
+}
+
+// SubjectOrder returns a sort rank so subjects always appear in a predictable,
+// useful order: main first, then bootstrap, kickoff, roadmap, extras.
+func SubjectOrder(kind string) int {
+	for i, k := range KnownKinds {
+		if k == kind {
+			return i
+		}
+	}
+	return len(KnownKinds)
+}
+
+// SubjectLabel is the human-readable badge for a subject kind.
+func SubjectLabel(kind string) string {
+	if kind == "" {
+		return "main"
+	}
+	return kind
 }
 
 // SubjectFile is the canonical filename: my_ls.pdf, my_ls-bootstrap.pdf.
@@ -147,4 +198,155 @@ func SubjectFile(project, kind, ext string) string {
 		return project + ext
 	}
 	return project + "-" + kind + ext
+}
+
+// AuthorizedInfo holds authorized/forbidden functions parsed from a subject PDF.
+type AuthorizedInfo struct {
+	Allowed   []string // explicit function names/globs, e.g. "malloc", "sf*"
+	Forbidden []string // explicit forbidden functions when "all libc minus..."
+	Note      string   // summary note when a whole library is allowed
+}
+
+var (
+	identRe     = regexp.MustCompile(`^[A-Za-z_*][A-Za-z0-9_*]*(?:\([0-9a-z]+\))?$`)
+	bulletRe    = regexp.MustCompile(`^(?:[•◦▪▫–—\-*]|3)\s+`)
+	manSuffixRe = regexp.MustCompile(`\([0-9a-z]+\)$`)
+)
+
+// ParseAuthorized extracts authorized/forbidden function rules from the full
+// pdftotext output of an Epitech subject PDF.
+func ParseAuthorized(text string) AuthorizedInfo {
+	lines := strings.Split(text, "\n")
+	var info AuthorizedInfo
+	var notes []string
+	seenAllowed := map[string]bool{}
+	seenForbidden := map[string]bool{}
+
+	addFn := func(dst *[]string, seen map[string]bool, raw string) {
+		raw = strings.TrimSpace(raw)
+		raw = strings.TrimRight(raw, ".,;:")
+		raw = manSuffixRe.ReplaceAllString(raw, "")
+		if raw == "" || !identRe.MatchString(raw) {
+			return
+		}
+		// Reject plain English words that show up in sentences.
+		switch strings.ToLower(raw) {
+		case "all", "the", "only", "and", "from", "none", "any", "libc", "library",
+			"functions", "function", "minus", "forbidden", "authorized", "allowed",
+			"system", "calls", "following", "ones", "are", "is", "of", "in", "to",
+			"for", "with", "math", "csfml", "here", "full", "list", "unspecified",
+			"de", "facto", "banned":
+			// Keep "system" only when explicitly listed in a comma list or forbidden list;
+			// handled by caller context below.
+			if strings.ToLower(raw) != "system" {
+				return
+			}
+		}
+		if !seen[raw] {
+			seen[raw] = true
+			*dst = append(*dst, raw)
+		}
+	}
+
+	parseList := func(dst *[]string, seen map[string]bool, s string) int {
+		before := len(*dst)
+		for _, tok := range strings.FieldsFunc(s, func(r rune) bool {
+			return r == ',' || r == ';' || r == ' ' || r == '\t'
+		}) {
+			addFn(dst, seen, tok)
+		}
+		return len(*dst) - before
+	}
+
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		low := strings.ToLower(line)
+
+		// Inline "Forbidden functions: ..."
+		if strings.HasPrefix(low, "forbidden functions:") || strings.HasPrefix(low, "banned functions:") {
+			rest := strings.TrimSpace(line[strings.Index(line, ":")+1:])
+			parseList(&info.Forbidden, seenForbidden, rest)
+			// Continuation lines until blank or next heading.
+			for j := i + 1; j < len(lines) && j < i+6; j++ {
+				nxt := strings.TrimSpace(lines[j])
+				if nxt == "" || strings.Contains(nxt, ":") || strings.HasPrefix(nxt, "∇") || strings.HasPrefix(nxt, "$>") {
+					break
+				}
+				if parseList(&info.Forbidden, seenForbidden, nxt) == 0 {
+					break
+				}
+			}
+			continue
+		}
+
+		// Inline "Authorized functions: ..." or "Allowed functions: ..."
+		if strings.HasPrefix(low, "authorized functions:") || strings.HasPrefix(low, "allowed functions:") {
+			rest := strings.TrimSpace(line[strings.Index(line, ":")+1:])
+			lowRest := strings.ToLower(rest)
+			if strings.Contains(lowRest, "all") && (strings.Contains(lowRest, "libc") || strings.Contains(lowRest, "minus") || strings.Contains(lowRest, "function")) {
+				notes = append(notes, rest)
+				continue
+			}
+			parseList(&info.Allowed, seenAllowed, rest)
+			for j := i + 1; j < len(lines) && j < i+6; j++ {
+				nxt := strings.TrimSpace(lines[j])
+				if nxt == "" || strings.Contains(nxt, ":") {
+					break
+				}
+				if parseList(&info.Allowed, seenAllowed, nxt) == 0 {
+					break
+				}
+			}
+			continue
+		}
+
+		// Section heading "Authorized Functions" / "Allowed Functions"
+		if low == "authorized functions" || low == "allowed functions" {
+			curLib := ""
+			for j := i + 1; j < len(lines) && j < i+45; j++ {
+				nxt := strings.TrimSpace(lines[j])
+				lowNxt := strings.ToLower(nxt)
+				if nxt == "" || nxt == "\f" {
+					continue
+				}
+				if strings.HasPrefix(lowNxt, "any unspecified") || strings.HasPrefix(lowNxt, "usage") ||
+					strings.HasPrefix(lowNxt, "examples") || strings.HasPrefix(lowNxt, "bonus") ||
+					strings.HasPrefix(lowNxt, "v ") || regexp.MustCompile(`^\d+$`).MatchString(nxt) {
+					if len(info.Allowed) > 0 || len(notes) > 0 {
+						break
+					}
+					continue
+				}
+				if strings.HasPrefix(lowNxt, "from the ") {
+					curLib = strings.TrimSpace(strings.TrimPrefix(lowNxt, "from the "))
+					continue
+				}
+				if strings.HasPrefix(lowNxt, "all functions") {
+					if strings.Contains(curLib, "csfml") {
+						addFn(&info.Allowed, seenAllowed, "sf*")
+						notes = append(notes, "all CSFML (sf*)")
+					} else if curLib != "" {
+						notes = append(notes, "all "+curLib)
+					} else {
+						notes = append(notes, "all functions")
+					}
+					continue
+				}
+				if bulletRe.MatchString(nxt) {
+					body := bulletRe.ReplaceAllString(nxt, "")
+					parseList(&info.Allowed, seenAllowed, body)
+					continue
+				}
+				// Introductory sentence right after heading.
+				if strings.Contains(lowNxt, "following") || strings.Contains(lowNxt, "full list") || strings.Contains(lowNxt, "allowed") {
+					continue
+				}
+				if len(info.Allowed) > 0 || len(notes) > 0 {
+					break
+				}
+			}
+		}
+	}
+	info.Note = strings.Join(notes, " · ")
+	return info
 }

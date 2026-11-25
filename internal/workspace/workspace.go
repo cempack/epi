@@ -2,9 +2,13 @@
 //
 //	<root>/tekN/<module>/<project>   git repos
 //	<root>/tekN/<module>/subjects/   subject PDFs, kept outside the repos
+//	<root>/docs/                     shared reference docs (coding style, etc.)
 package workspace
 
 import (
+	"bytes"
+	"context"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,6 +31,22 @@ func Root() string {
 	return filepath.Join(home, "Epitech")
 }
 
+// Subject is a filed document belonging to a project.
+type Subject struct {
+	Path  string
+	Name  string // base filename, e.g. my_sudo-bootstrap.pdf
+	Kind  string // "", "bootstrap", "kickoff", "roadmap", ...
+	Label string // "main", "bootstrap", ...
+}
+
+// Bootstrap describes the optional <project>/bootstrap/ workspace inside a repo.
+type Bootstrap struct {
+	HasDir   bool
+	Dir      string
+	Tracked  bool     // any file under bootstrap/ is tracked by git
+	Binaries []string // compiled ELF binaries or .o files inside bootstrap/
+}
+
 type Git struct {
 	IsRepo     bool
 	Branch     string
@@ -35,6 +55,7 @@ type Git struct {
 	Ahead      int // commits not pushed
 	Behind     int
 	LastCommit time.Time
+	LastAuthor string
 	LastMsg    string
 	Remote     string
 }
@@ -42,11 +63,56 @@ type Git struct {
 func (g Git) Clean() bool { return g.Dirty == 0 && g.Untracked == 0 && g.Ahead == 0 }
 
 type Project struct {
-	Name     string
-	Path     string
-	Module   *Module
-	Git      Git
-	Subjects []string // absolute paths of this project's subject files
+	Name      string
+	Path      string
+	Module    *Module
+	Git       Git
+	Subjects  []Subject // semantically sorted: main, bootstrap, kickoff, roadmap, ...
+	Bootstrap Bootstrap
+	HasMain   bool      // root Makefile, src/ or include/ exists
+	ModTime   time.Time // fallback activity timestamp when there are no commits yet
+}
+
+// MainSubject returns the project's primary subject (kind == ""), or nil.
+func (p *Project) MainSubject() *Subject { return p.SubjectByKind("") }
+
+// BootstrapSubject returns the project's bootstrap subject, or nil.
+func (p *Project) BootstrapSubject() *Subject { return p.SubjectByKind("bootstrap") }
+
+// SubjectByKind finds the first subject whose kind matches (exact or prefix).
+func (p *Project) SubjectByKind(kind string) *Subject {
+	q := strings.ToLower(strings.TrimSpace(kind))
+	if q == "main" {
+		q = ""
+	}
+	for i := range p.Subjects {
+		if p.Subjects[i].Kind == q {
+			return &p.Subjects[i]
+		}
+	}
+	if q != "" {
+		for i := range p.Subjects {
+			if strings.HasPrefix(p.Subjects[i].Kind, q) {
+				return &p.Subjects[i]
+			}
+		}
+	}
+	return nil
+}
+
+// InBootstrapPhase reports whether the project appears to still be in its
+// bootstrap stage (has a bootstrap folder or bootstrap PDF, but no root
+// Makefile/src yet).
+func (p *Project) InBootstrapPhase() bool {
+	return (p.Bootstrap.HasDir || p.BootstrapSubject() != nil) && !p.HasMain
+}
+
+// LatestActivity returns the latest commit time, falling back to filesystem mtime.
+func (p *Project) LatestActivity() time.Time {
+	if !p.Git.LastCommit.IsZero() {
+		return p.Git.LastCommit
+	}
+	return p.ModTime
 }
 
 type Module struct {
@@ -70,7 +136,7 @@ func (m *Module) Label() string {
 
 var tekRe = regexp.MustCompile(`^tek\d+$`)
 
-// Scan walks the tree and loads git state for every project concurrently.
+// Scan walks the tree and loads git and bootstrap state concurrently.
 func Scan(root string) ([]*Module, error) {
 	teks, err := os.ReadDir(root)
 	if err != nil {
@@ -101,6 +167,9 @@ func Scan(root string) ([]*Module, error) {
 					}
 				case p.IsDir() && !strings.HasPrefix(p.Name(), "."):
 					pr := &Project{Name: p.Name(), Path: filepath.Join(m.Path, p.Name()), Module: m}
+					if info, err := p.Info(); err == nil {
+						pr.ModTime = info.ModTime()
+					}
 					m.Projects = append(m.Projects, pr)
 					projects = append(projects, pr)
 				}
@@ -108,22 +177,42 @@ func Scan(root string) ([]*Module, error) {
 			mods = append(mods, m)
 		}
 	}
-	// Attach subjects to projects: "my_ls.pdf" and "my_ls-*.pdf" belong to my_ls.
+	// Attach subjects to projects and sort them semantically (main first,
+	// then bootstrap, kickoff, roadmap, extras).
 	for _, m := range mods {
 		for _, p := range m.Projects {
 			for _, s := range m.Subjects {
-				base := strings.TrimSuffix(filepath.Base(s), filepath.Ext(s))
+				name := filepath.Base(s)
+				base := strings.TrimSuffix(name, filepath.Ext(name))
 				if base == p.Name || strings.HasPrefix(base, p.Name+"-") {
-					p.Subjects = append(p.Subjects, s)
+					kind := epitech.SubjectKindFromFile(p.Name, name)
+					p.Subjects = append(p.Subjects, Subject{
+						Path:  s,
+						Name:  name,
+						Kind:  kind,
+						Label: epitech.SubjectLabel(kind),
+					})
 				}
 			}
+			sort.Slice(p.Subjects, func(i, j int) bool {
+				oi, oj := epitech.SubjectOrder(p.Subjects[i].Kind), epitech.SubjectOrder(p.Subjects[j].Kind)
+				if oi != oj {
+					return oi < oj
+				}
+				return p.Subjects[i].Name < p.Subjects[j].Name
+			})
 		}
 	}
-	// Fan out: one goroutine per repo, joined by a WaitGroup.
+	// Fan out: one goroutine per project, joined by a WaitGroup.
 	var wg sync.WaitGroup
 	for _, p := range projects {
 		wg.Add(1)
-		go func(p *Project) { defer wg.Done(); p.Git = ReadGit(p.Path) }(p)
+		go func(p *Project) {
+			defer wg.Done()
+			p.Git = ReadGit(p.Path)
+			p.HasMain = hasMainFiles(p.Path)
+			p.Bootstrap = readBootstrap(p.Path, p.Git.IsRepo)
+		}(p)
 	}
 	wg.Wait()
 	sort.SliceStable(mods, func(i, j int) bool {
@@ -133,6 +222,70 @@ func Scan(root string) ([]*Module, error) {
 		return moduleRank(mods[i]) < moduleRank(mods[j])
 	})
 	return mods, nil
+}
+
+// ScanDocs returns sorted file paths inside <root>/docs/.
+func ScanDocs(root string) []string {
+	entries, err := os.ReadDir(filepath.Join(root, "docs"))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			out = append(out, filepath.Join(root, "docs", e.Name()))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func hasMainFiles(dir string) bool {
+	for _, name := range []string{"Makefile", "src", "include"} {
+		if Exists(filepath.Join(dir, name)) {
+			return true
+		}
+	}
+	return false
+}
+
+func readBootstrap(dir string, isRepo bool) Bootstrap {
+	bdir := filepath.Join(dir, "bootstrap")
+	info, err := os.Stat(bdir)
+	if err != nil || !info.IsDir() {
+		return Bootstrap{}
+	}
+	b := Bootstrap{HasDir: true, Dir: bdir}
+	if isRepo {
+		if out := git(dir, "ls-files", "bootstrap"); out != "" {
+			b.Tracked = true
+		}
+	}
+	_ = filepath.WalkDir(bdir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if strings.HasSuffix(name, ".o") || strings.HasSuffix(name, ".a") || IsELF(path) {
+			b.Binaries = append(b.Binaries, path)
+		}
+		return nil
+	})
+	return b
+}
+
+var elfMagic = []byte{0x7f, 'E', 'L', 'F'}
+
+// IsELF reports whether path starts with the ELF executable/object header.
+func IsELF(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var buf [4]byte
+	n, err := f.Read(buf[:])
+	return err == nil && n == 4 && bytes.Equal(buf[:], elfMagic)
 }
 
 // Pool first, workshops last, everything else alphabetical in between.
@@ -166,24 +319,115 @@ func ReadGit(dir string) Git {
 			g.Branch = strings.TrimPrefix(line, "# branch.head ")
 		case strings.HasPrefix(line, "# branch.ab "):
 			f := strings.Fields(line)
-			g.Ahead, _ = strconv.Atoi(strings.TrimPrefix(f[2], "+"))
-			g.Behind, _ = strconv.Atoi(strings.TrimPrefix(f[3], "-"))
+			if len(f) >= 4 {
+				g.Ahead, _ = strconv.Atoi(strings.TrimPrefix(f[2], "+"))
+				g.Behind, _ = strconv.Atoi(strings.TrimPrefix(f[3], "-"))
+			}
 		case strings.HasPrefix(line, "? "):
 			g.Untracked++
 		case len(line) > 1 && (line[0] == '1' || line[0] == '2' || line[0] == 'u'):
 			g.Dirty++
 		}
 	}
-	if log := git(dir, "log", "-1", "--format=%ct%x00%s"); log != "" {
-		parts := strings.SplitN(log, "\x00", 2)
+	if log := git(dir, "log", "-1", "--format=%ct%x00%an%x00%s"); log != "" {
+		parts := strings.SplitN(log, "\x00", 3)
 		if ts, err := strconv.ParseInt(parts[0], 10, 64); err == nil {
 			g.LastCommit = time.Unix(ts, 0)
 		}
-		if len(parts) == 2 {
-			g.LastMsg = parts[1]
+		if len(parts) >= 2 {
+			g.LastAuthor = parts[1]
+		}
+		if len(parts) == 3 {
+			g.LastMsg = parts[2]
 		}
 	}
 	return g
+}
+
+// FetchResult holds the outcome of fetching one repository.
+type FetchResult struct {
+	Project *Project
+	Err     error
+}
+
+// FetchAll runs `git fetch --all --prune --quiet` across every repo
+// concurrently and refreshes their Git state.
+func FetchAll(mods []*Module) []FetchResult {
+	var repos []*Project
+	for _, m := range mods {
+		for _, p := range m.Projects {
+			if p.Git.IsRepo && p.Git.Remote != "" {
+				repos = append(repos, p)
+			}
+		}
+	}
+	results := make([]FetchResult, len(repos))
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for i, p := range repos {
+		wg.Add(1)
+		go func(i int, p *Project) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "git", "-C", p.Path, "fetch", "--all", "--prune", "--quiet")
+			cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+			err := cmd.Run()
+			if err == nil {
+				p.Git = ReadGit(p.Path)
+			}
+			results[i] = FetchResult{Project: p, Err: err}
+		}(i, p)
+	}
+	wg.Wait()
+	return results
+}
+
+// FindProjects matches a query against project names (exact, squashed, prefix,
+// or substring) and returns hits ordered from strongest to weakest.
+func FindProjects(mods []*Module, query string) []*Project {
+	q := strings.ToLower(strings.TrimSpace(query))
+	sq := epitech.Squash(q)
+	if sq == "" {
+		return nil
+	}
+	var exact, prefix, sub []*Project
+	for _, m := range mods {
+		for _, p := range m.Projects {
+			low := strings.ToLower(p.Name)
+			psq := epitech.Squash(p.Name)
+			full := strings.ToLower(m.Dir + "/" + p.Name)
+			switch {
+			case low == q || full == q || psq == sq:
+				exact = append(exact, p)
+			case strings.HasPrefix(low, q) || strings.HasPrefix(psq, sq):
+				prefix = append(prefix, p)
+			case strings.Contains(low, q) || strings.Contains(psq, sq) || strings.Contains(epitech.Squash(m.Dir+p.Name), sq):
+				sub = append(sub, p)
+			}
+		}
+	}
+	if len(exact) > 0 {
+		return exact
+	}
+	if len(prefix) > 0 {
+		return prefix
+	}
+	return sub
+}
+
+// AllowedFilePath returns the file path where epitech-predeliver stores a
+// project's remembered authorized-functions list.
+func AllowedFilePath(projectPath string) string {
+	dataHome := os.Getenv("XDG_DATA_HOME")
+	if dataHome == "" {
+		home, _ := os.UserHomeDir()
+		dataHome = filepath.Join(home, ".local", "share")
+	}
+	encoded := strings.ReplaceAll(projectPath, "/", "%")
+	return filepath.Join(dataHome, "epitech-dump-arch", "allowed", encoded)
 }
 
 // RemoteKey normalizes any GitHub URL to "owner/name" (lowercase) so SSH and
